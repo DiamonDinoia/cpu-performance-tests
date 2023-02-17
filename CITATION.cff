@@ -1,0 +1,15 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: CPU Performance Tests
+message: >-
+  This software contains the code to benchmark CPU cache
+  miss latency and branch misprediction penalty.
+type: software
+authors:
+  - given-names: Marco
+    family-names: Barbone
+    email: m.barbone19@imperial.ac.uk
+    affiliation: Imperial College London
+    orcid: 'https://orcid.org/0000-0003-3495-7997'
