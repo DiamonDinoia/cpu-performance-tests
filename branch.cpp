@@ -35,11 +35,13 @@ auto constexpr operator"" _M(unsigned long long int n) {
 // instructions per cycle if the file exists it appends the branching
 // probability and the number of instructions per cycle
 static void write_csv(const unsigned branch_prob,
-                      const double   instructions_per_cycle) {
+                      const double   instructions_per_cycle,
+                      const bool    branchless = false
+                      ) {
     std::ofstream file;
     file.open("branch.csv", std::ios_base::app);
-    if (file.tellp() == 0) { file << "probability, cycles" << std::endl; }
-    file << branch_prob << ", " << instructions_per_cycle << std::endl;
+    if (file.tellp() == 0) { file << "probability,cycles,branchless" << std::endl; }
+    file << branch_prob << ", " << instructions_per_cycle <<"," << branchless << std::endl;
     file.close();
 }
 
@@ -65,7 +67,30 @@ static void branching_benchmark(const unsigned branch_prob) {
     write_csv(branch_prob, double(stop - start) / num_ops);
 }
 
+// This function is used to benchmark the branchless version
+// it takes a branch_prob parameter which is the probability of the branch being
+// taken it measures the number of instructions per cycle
+static void branchless_benchmark(const unsigned branch_prob) {
+    const auto                 num_ops = 100_M;
+    std::vector<unsigned long> list(num_ops);
+    // initialise the array with the distribution
+    for (auto i = 0; i < num_ops; ++i) { list[i] = distrib(m_generator); }
+
+    volatile int sum   = 0;
+    const auto   start = readTSC();
+    // sum the array into sum
+    for (auto i = 0; i < num_ops; ++i) {
+        sum += list[i] * (list[i] < branch_prob);
+    }
+    const auto stop = readTSC();
+    std::cout << "branchless_benchmark(" << branch_prob << ") took "
+              << double(stop - start) / num_ops << " cycles per iteration"
+              << std::endl;
+    write_csv(branch_prob, double(stop - start) / num_ops, true);
+}
+
 int main() {
     for (size_t i = 0; i < 101; i++) { branching_benchmark(i); }
+    for (size_t i = 0; i < 101; i++) { branchless_benchmark(i); }
     return 0;
 }

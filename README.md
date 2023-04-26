@@ -28,6 +28,26 @@ The key `volatile` is used to prevent the compiler from optimizing and vectorizi
 
 The results show a somewhat expected behavior: when the probability is not exactly 1/2, the branch predictor can guess the most likely outcome, thus reducing the cycles per iteration. When the probability is exactly either 0 or 1, there is no stochastic behavior, and the loop executes in two or three clock cycles. 
 
+Branchless programming can be applied in this case to avoid the branching entirely. The result of comparison is usually intrepreted as a 0 or 1 that means that in this case it is possible to multiply `random[i]` with the result of the comparison `random[i] < P`. The resulting code looks as follows:
+```cpp
+// Generate a random array with a discrete distribution
+int random[N] = {Uniform_distribution(0,100)}
+volatile int sum = 0; // volatile is used to prevent vectorization and other optimisations
+//count the clock cycles using rdtsc 
+const auto start = __rdtsc();
+for(i to N){
+    sum += random[i] * (random[i] < P);
+}
+// count the clock cycles
+const auto stop = __rdtsc();
+// compute the clock cycles per iteration
+const auto cyclesPerIteration =  double(stop - start)/num_op;
+```
+
+![branch penalty chart](images/branchless.png)
+
+The results show that the branchless execution is faster then the branching solution in almost all cases. Towards 100% branching probability the previous solution has a slight advantage
+
 ### Memory latency
 
 The pseudocode for the benchmark is as follows:
