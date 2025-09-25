@@ -28,6 +28,14 @@ CPMAddPackage(
   OPTIONS "BENCHMARK_ENABLE_TESTING Off"
 )
 
+CPMAddPackage(
+  NAME xsimd
+  GITHUB_REPOSITORY xtensor-stack/xsimd
+  GIT_TAG 13.2.0
+)
+
+find_package(OpenMP REQUIRED)
+
 include_directories(include)
 
 add_executable(latency-test latency.cpp)
@@ -36,3 +44,8 @@ target_compile_features(latency-test PRIVATE cxx_std_17) # This means at least C
 
 add_executable(branch-test branch.cpp)
 target_compile_features(branch-test PRIVATE cxx_std_17) # This means at least C++17
+
+add_executable(memory-bandwidth bandwidth.cpp)
+target_link_libraries(memory-bandwidth PRIVATE xsimd OpenMP::OpenMP_CXX)
+target_compile_features(memory-bandwidth PRIVATE cxx_std_17)
+target_compile_options(memory-bandwidth PRIVATE -march=native)
