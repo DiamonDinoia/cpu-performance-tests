@@ -33,9 +33,9 @@ struct ThreadData {
     std::vector<double, xsimd::aligned_allocator<double>> flush_buffer;
 };
 
-std::size_t      simd_width() { return batch_type::size; }
+constexpr std::size_t simd_width() { return batch_type::size; }
 
-std::string_view trim(std::string_view value) {
+std::string_view      trim(std::string_view value) {
     while (!value.empty() &&
            std::isspace(static_cast<unsigned char>(value.front()))) {
         value.remove_prefix(1);
@@ -246,16 +246,19 @@ std::string format_megabytes(std::size_t bytes) {
     return oss.str();
 }
 
-double finalize_thread_sums(const std::vector<batch_type> &lane_sums,
-                            const std::vector<double>     &tail_sums) {
-    batch_type total_batch(0.0);
-    for (const auto &lane : lane_sums) { total_batch += lane; }
+// ---------- SINK to prevent DCE without volatile ----------
 
-    double total = xsimd::reduce_add(total_batch);
-    for (double tail : tail_sums) { total += tail; }
-
-    return total;
+#if defined(__clang__) || defined(__GNUG__)
+[[gnu::noinline]] static void sink(batch_type v) {
+    asm volatile("" : : "x"(v));
 }
+#else
+// Fallback: do a trivial reduction (kept minimal) if inline asm isn't
+// supported.
+static void sink(batch_type v) { (void)xsimd::hadd(v); }
+#endif
+
+// ----------------------------------------------------------
 
 void flush_caches_for_threads(std::vector<ThreadData> &threads,
                               std::vector<double>     &flush_sums) {
@@ -272,56 +275,45 @@ void flush_caches_for_threads(std::vector<ThreadData> &threads,
     }
 }
 
+[[gnu::noinline]]
 void aligned_read_kernel(const std::vector<ThreadData> &threads,
-                         std::size_t                    elements_per_thread,
-                         std::vector<batch_type>       &lane_sums,
-                         std::vector<double>           &tail_sums) {
+                         std::size_t                    elements_per_thread) {
     const std::size_t width = simd_width();
 
 #pragma omp parallel
     {
         const int     tid  = omp_get_thread_num();
         const double *data = threads[tid].source.data();
-
-        batch_type    batch_sum(0.0);
-        std::size_t   index = 0;
-        for (; index + width <= elements_per_thread; index += width) {
-            batch_sum += batch_type::load_aligned(data + index);
+        asm volatile("" ::: "memory");
+        for (std::size_t index = 0; index + width <= elements_per_thread;
+             index += width) {
+            auto v = batch_type::load_aligned(data + index);
+            sink(v);
         }
-
-        double tail = 0.0;
-        for (; index < elements_per_thread; ++index) { tail += data[index]; }
-
-        lane_sums[tid] = batch_sum;
-        tail_sums[tid] = tail;
+        asm volatile("" ::: "memory");
     }
 }
 
+[[gnu::noinline]]
 void unaligned_read_kernel(const std::vector<ThreadData> &threads,
-                           std::size_t                    elements_per_thread,
-                           std::vector<batch_type>       &lane_sums,
-                           std::vector<double>           &tail_sums) {
+                           std::size_t                    elements_per_thread) {
     const std::size_t width = simd_width();
 
 #pragma omp parallel
     {
         const int     tid  = omp_get_thread_num();
-        const double *data = threads[tid].source.data() + 1;
-
-        batch_type    batch_sum(0.0);
-        std::size_t   index = 0;
-        for (; index + width <= elements_per_thread; index += width) {
-            batch_sum += batch_type::load_unaligned(data + index);
+        const double *data = threads[tid].source.data() + 1;  // misalign
+        asm volatile("" ::: "memory");
+        for (std::size_t index = 0; index + width <= elements_per_thread;
+             index += width) {
+            auto v = batch_type::load_unaligned(data + index);
+            sink(v);
         }
-
-        double tail = 0.0;
-        for (; index < elements_per_thread; ++index) { tail += data[index]; }
-
-        lane_sums[tid] = batch_sum;
-        tail_sums[tid] = tail;
+        asm volatile("" ::: "memory");
     }
 }
 
+[[gnu::noinline]]
 void aligned_write_kernel(std::vector<ThreadData> &threads,
                           std::size_t elements_per_thread, double value) {
     const std::size_t width = simd_width();
@@ -329,18 +321,18 @@ void aligned_write_kernel(std::vector<ThreadData> &threads,
 
 #pragma omp parallel
     {
-        const int   tid   = omp_get_thread_num();
-        double     *data  = threads[tid].write_target.data();
-
-        std::size_t index = 0;
-        for (; index + width <= elements_per_thread; index += width) {
+        const int tid  = omp_get_thread_num();
+        double   *data = threads[tid].write_target.data();
+        asm volatile("" ::: "memory");
+        for (std::size_t index = 0; index + width <= elements_per_thread;
+             index += width) {
             value_batch.store_aligned(data + index);
         }
-
-        for (; index < elements_per_thread; ++index) { data[index] = value; }
+        asm volatile("" ::: "memory");
     }
 }
 
+[[gnu::noinline]]
 void unaligned_write_kernel(std::vector<ThreadData> &threads,
                             std::size_t elements_per_thread, double value) {
     const std::size_t width = simd_width();
@@ -348,59 +340,56 @@ void unaligned_write_kernel(std::vector<ThreadData> &threads,
 
 #pragma omp parallel
     {
-        const int   tid   = omp_get_thread_num();
-        double     *data  = threads[tid].write_target.data() + 1;
-
-        std::size_t index = 0;
-        for (; index + width <= elements_per_thread; index += width) {
+        const int tid  = omp_get_thread_num();
+        double   *data = threads[tid].write_target.data() + 1;  // misalign
+        asm volatile("" ::: "memory");
+        for (std::size_t index = 0; index + width <= elements_per_thread;
+             index += width) {
             value_batch.store_unaligned(data + index);
         }
-
-        for (; index < elements_per_thread; ++index) { data[index] = value; }
+        asm volatile("" ::: "memory");
     }
 }
 
+[[gnu::noinline]]
 void aligned_copy_kernel(std::vector<ThreadData> &threads,
                          std::size_t              elements_per_thread) {
     const std::size_t width = simd_width();
 
 #pragma omp parallel
     {
-        const int     tid   = omp_get_thread_num();
-        double       *dst   = threads[tid].copy_target.data();
-        const double *src   = threads[tid].source.data();
+        const int     tid = omp_get_thread_num();
+        double       *dst = threads[tid].copy_target.data();
+        const double *src = threads[tid].source.data();
 
-        std::size_t   index = 0;
-        for (; index + width <= elements_per_thread; index += width) {
-            batch_type values = batch_type::load_aligned(src + index);
-            values.store_aligned(dst + index);
+        asm volatile("" ::: "memory");
+        for (std::size_t index = 0; index + width <= elements_per_thread;
+             index += width) {
+            batch_type v = batch_type::load_aligned(src + index);
+            v.store_aligned(dst + index);
         }
-
-        for (; index < elements_per_thread; ++index) {
-            dst[index] = src[index];
-        }
+        asm volatile("" ::: "memory");
     }
 }
 
+[[gnu::noinline]]
 void unaligned_copy_kernel(std::vector<ThreadData> &threads,
                            std::size_t              elements_per_thread) {
     const std::size_t width = simd_width();
 
 #pragma omp parallel
     {
-        const int     tid   = omp_get_thread_num();
-        double       *dst   = threads[tid].copy_target.data() + 1;
-        const double *src   = threads[tid].source.data() + 1;
+        const int     tid = omp_get_thread_num();
+        double       *dst = threads[tid].copy_target.data() + 1;  // misalign
+        const double *src = threads[tid].source.data() + 1;       // misalign
 
-        std::size_t   index = 0;
-        for (; index + width <= elements_per_thread; index += width) {
-            batch_type values = batch_type::load_unaligned(src + index);
-            values.store_unaligned(dst + index);
+        asm volatile("" ::: "memory");
+        for (std::size_t index = 0; index + width <= elements_per_thread;
+             index += width) {
+            batch_type v = batch_type::load_unaligned(src + index);
+            v.store_unaligned(dst + index);
         }
-
-        for (; index < elements_per_thread; ++index) {
-            dst[index] = src[index];
-        }
+        asm volatile("" ::: "memory");
     }
 }
 
@@ -461,7 +450,6 @@ int main(int argc, char **argv) {
 
     omp_set_num_threads(options.threads);
     const int         thread_count    = omp_get_max_threads();
-
     const std::size_t width           = simd_width();
 
     std::size_t       requested_bytes = options.target_bytes;
@@ -486,9 +474,10 @@ int main(int argc, char **argv) {
         elements_per_thread, 8ULL * 1024ULL * 1024ULL / sizeof(double));
 
     std::vector<ThreadData> thread_data(static_cast<std::size_t>(thread_count));
-#pragma omp parallel for
-    for (int tid = 0; tid < thread_count; ++tid) {
-        auto &data = thread_data[tid];
+#pragma omp parallel
+    {
+        const auto tid  = omp_get_thread_num();
+        auto      &data = thread_data[tid];
         data.source.resize(elements_per_thread + width);
         data.write_target.resize(elements_per_thread + width);
         data.copy_target.resize(elements_per_thread + width);
@@ -501,9 +490,15 @@ int main(int argc, char **argv) {
         std::iota(data.flush_buffer.begin(), data.flush_buffer.end(), 1.0);
     }
 
-    const std::size_t bytes_per_iteration =
-        per_thread_bytes * static_cast<std::size_t>(thread_count);
-    const std::size_t copy_bytes_per_iteration = bytes_per_iteration * 2;
+    // bytes actually processed (only full SIMD blocks)
+    const std::size_t full_blocks_per_thread =
+        (elements_per_thread / width) * width;
+    const std::size_t processed_bytes_per_thread =
+        full_blocks_per_thread * sizeof(double);
+    const std::size_t processed_bytes_all_threads =
+        processed_bytes_per_thread * static_cast<std::size_t>(thread_count);
+    const std::size_t processed_copy_bytes_all_threads =
+        processed_bytes_all_threads * 2;
 
     std::cout << "Requested size: " << format_megabytes(options.target_bytes)
               << " (" << options.target_bytes << " bytes)" << std::endl;
@@ -521,11 +516,7 @@ int main(int argc, char **argv) {
     std::cout << "SIMD width: " << width << " doubles" << std::endl;
     std::cout << "Iterations per test: " << options.iterations << std::endl;
 
-    std::vector<batch_type> lane_sums(static_cast<std::size_t>(thread_count));
-    std::vector<double> tail_sums(static_cast<std::size_t>(thread_count), 0.0);
     std::vector<double> flush_sums(static_cast<std::size_t>(thread_count), 0.0);
-
-    volatile double     read_sink  = 0.0;
     volatile double     flush_sink = 0.0;
 
     auto                flush      = [&] {
@@ -535,60 +526,45 @@ int main(int argc, char **argv) {
         flush_sink = total;
     };
 
-    auto finalize_read = [&] {
-        read_sink = finalize_thread_sums(lane_sums, tail_sums);
-    };
-
     auto aligned_read_timed = [&] {
-        for (auto &lane : lane_sums) { lane = batch_type(0.0); }
-        std::fill(tail_sums.begin(), tail_sums.end(), 0.0);
-        aligned_read_kernel(thread_data, elements_per_thread, lane_sums,
-                            tail_sums);
+        aligned_read_kernel(thread_data, elements_per_thread);
     };
-
-    run_benchmark("Aligned read", bytes_per_iteration, options.iterations,
-                  flush, aligned_read_timed, finalize_read);
-
     auto unaligned_read_timed = [&] {
-        for (auto &lane : lane_sums) { lane = batch_type(0.0); }
-        std::fill(tail_sums.begin(), tail_sums.end(), 0.0);
-        unaligned_read_kernel(thread_data, elements_per_thread, lane_sums,
-                              tail_sums);
+        unaligned_read_kernel(thread_data, elements_per_thread);
     };
-
-    run_benchmark("Unaligned read", bytes_per_iteration, options.iterations,
-                  flush, unaligned_read_timed, finalize_read);
-
     auto aligned_write_timed = [&] {
         aligned_write_kernel(thread_data, elements_per_thread, 1.0);
     };
-
-    run_benchmark("Aligned write", bytes_per_iteration, options.iterations,
-                  flush, aligned_write_timed, [] {});
-
     auto unaligned_write_timed = [&] {
         unaligned_write_kernel(thread_data, elements_per_thread, 1.0);
     };
-
-    run_benchmark("Unaligned write", bytes_per_iteration, options.iterations,
-                  flush, unaligned_write_timed, [] {});
-
     auto aligned_copy_timed = [&] {
         aligned_copy_kernel(thread_data, elements_per_thread);
     };
-
-    run_benchmark("Aligned copy", copy_bytes_per_iteration, options.iterations,
-                  flush, aligned_copy_timed, [] {});
-
     auto unaligned_copy_timed = [&] {
         unaligned_copy_kernel(thread_data, elements_per_thread);
     };
 
-    run_benchmark("Unaligned copy", copy_bytes_per_iteration,
+    std::cout << "Measured bytes per iteration (reads/writes use full SIMD "
+                 "blocks only): "
+              << processed_bytes_all_threads
+              << " B, copies: " << processed_copy_bytes_all_threads << " B"
+              << std::endl;
+
+    run_benchmark("Aligned read", processed_bytes_all_threads,
+                  options.iterations, flush, aligned_read_timed, [] {});
+    run_benchmark("Unaligned read", processed_bytes_all_threads,
+                  options.iterations, flush, unaligned_read_timed, [] {});
+    run_benchmark("Aligned write", processed_bytes_all_threads,
+                  options.iterations, flush, aligned_write_timed, [] {});
+    run_benchmark("Unaligned write", processed_bytes_all_threads,
+                  options.iterations, flush, unaligned_write_timed, [] {});
+    run_benchmark("Aligned copy", processed_copy_bytes_all_threads,
+                  options.iterations, flush, aligned_copy_timed, [] {});
+    run_benchmark("Unaligned copy", processed_copy_bytes_all_threads,
                   options.iterations, flush, unaligned_copy_timed, [] {});
 
     std::ofstream dev_null("/dev/null");
-    dev_null << "Read sink (ignore): " << read_sink << std::endl;
     dev_null << "Flush sink (ignore): " << flush_sink << std::endl;
     return 0;
 }
